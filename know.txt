@@ -1,0 +1,320 @@
+# WHAM — Whale Audio VampNet Pipeline
+# Complete Setup & Execution Log
+# Date: September 14, 2026
+
+================================================================
+1. WHAT IS WHAM
+================================================================
+
+WHAM (Whale Audio with VampNet) is a pipeline that:
+- Extracts neural embeddings from whale audio using VampNet
+- Generates synthetic whale call pseudocodas using a coarse-to-fine
+  autoregressive codec model
+- Evaluates generated audio quality using Fréchet Audio Distance (FAD)
+
+It was designed for the DSWP (Deep Sound Whale Project) dataset
+containing ~300 whale audio recordings.
+
+================================================================
+2. ENVIRONMENT
+================================================================
+
+- Machine:       MacBook with Apple Silicon (M5), 16GB RAM
+- OS:            macOS (Darwin)
+- Python:        3.10.14 (via pyenv)
+- PyTorch:       2.x with MPS (Metal Performance Shaders) GPU backend
+- Virtual env:   ~/wham_project/wham_env
+- WHAM repo:     ~/wham_project/wham (cloned from GitHub)
+- License:       CC BY-NC-ND 4.0 (pretrained weights — non-commercial)
+
+================================================================
+3. INSTALLATION STEPS
+================================================================
+
+3a. Python 3.10 via pyenv
+    - brew install pyenv
+    - pyenv install 3.10.14
+    - pyenv local 3.10.14
+
+3b. Virtual environment
+    - python3.10 -m venv ~/wham_project/wham_env
+
+3c. WHAM repo clone
+    - git clone <repo> ~/wham_project/wham
+
+3d. Dependencies installed (in order):
+    - pip install -e . (wham itself)
+    - pip install -e ./vampnet (vampnet subpackage)
+    - pip install torch torchaudio (CPU/MPS build)
+    - pip install madmom --no-build-isolation
+    - pip install huggingface-hub<1.0 (pinned for API compat)
+    - pip install soundfile librosa numpy scipy
+    - pip install -e . (wham again, to resolve path issues)
+    - ffmpeg installed via brew
+
+3e. Pretrained weights downloaded from Zenodo:
+    - vampnet/models/coarse.pth   (1.3 GB) — coarse autoregressive model
+    - vampnet/models/c2f.pth      (1.0 GB) — coarse-to-fine refinement
+    - vampnet/models/codec.pth    (573 MB) — neural audio codec
+    - vampnet/models/wavebeat.pth (32 MB)  — beat tracking model
+
+3f. DSWP dataset:
+    - Downloaded 243 WAV files (subset of full ~300)
+    - Location: vampnet/data/testing_data/dswp_subset/
+    - Format: mono WAV, various sample rates
+
+================================================================
+4. SOURCE PATCHES APPLIED
+================================================================
+
+The codebase required 4 patches for compatibility:
+
+Patch 1: madmom/processors.py
+  OLD: collections.MutableSequence
+  NEW: collections.abc.MutableSequence
+  WHY:  collections.abc is required in Python 3.10+
+
+Patch 2: wham/embedding/__init__.py
+  OLD: from wam import VAMPNET_DIR
+  NEW: from wham import VAMPNET_DIR
+  WHY:  The repo directory is named "wham" not "wam"
+
+Patch 3: wham/embedding/models.py
+  OLD: from wam import VAMPNET_DIR
+  NEW: from wham import VAMPNET_DIR
+  WHY:  Same as Patch 2
+
+Patch 4: vampnet/vampnet/beats.py
+  OLD: torch.load(path)
+  NEW: torch.load(path, weights_only=False)
+  WHY:  PyTorch 2.x changed default to weights_only=True
+
+================================================================
+5. WHAT WE DID — STEP BY STEP
+================================================================
+
+STEP A: EXTRACT EMBEDDINGS FROM DSWP AUDIO
+  Script:  ~/wham_project/wham/extract_dswp_embeddings.py
+  Input:   vampnet/data/testing_data/dswp_subset/*.wav (243 files)
+  Output:  ~/wham_project/wham/embeddings/*.npy (243 files)
+  Device:  MPS (confirmed via log output)
+  Time:    ~17 minutes
+
+  How it works:
+  1. Loads VampNetWrapper with coarse + c2f weights on MPS
+  2. For each WAV file:
+     a. Reads audio with soundfile
+     b. Converts to mono if stereo
+     c. Resamples to 16kHz if needed (librosa)
+     d. Converts to torch tensor (1, N_samples)
+     e. Runs wrapper(audio_tensor) on MPS
+     f. Output shape: (1, seq_len, 1280) float32
+     g. Saves as .npy file
+
+  Key deviation from notebook:
+  - Used wrapper.forward() (i.e. wrapper(audio)) NOT wrapper.encode()
+  - VampNetWrapper has no encode() method
+  - Input must be raw 16kHz audio tensor, not AudioSignal object
+
+STEP B: GENERATE PSEUDOCODAS
+  Script:  ~/wham_project/wham/vampnet/batch_generate.py
+  Input:   Embeddings from STEP A (used as conditioning)
+  Output:  ~/wham_project/wham/generated_audio/pseudocoda_*.wav (20 files)
+  Device:  MPS (confirmed via log output)
+  Time:    ~14 minutes (~42s per file)
+
+  How it works:
+  1. Loads VampNet Interface on MPS with argbind
+  2. For each embedding:
+     a. Loads the .npy embedding
+     b. Converts to torch tensor, moves to MPS
+     c. interface.preprocess() — prepares latent representation
+     d. interface.encode() — encodes to discrete codes
+     e. Creates pmask (perturbation mask) for diversity
+     f. interface.coarse_vamp() — autoregressive sampling
+     g. interface.to_signal() — decodes codes to audio waveform
+     h. Saves as WAV file
+
+  Key deviation from notebook:
+  - Rewrote batch_generate.py to match app.py's _vamp() pattern
+  - Used interface.preprocess/encode/coarse_vamp/to_signal pipeline
+  - Not a non-existent wrapper.encode() API
+
+STEP C: COMPUTE FAD SCORE
+  Script:  ~/wham_project/wham/compute_fad.py
+  Input:   Real embeddings (from STEP A) + generated embeddings
+  Output:  FAD score printed to stdout
+  Device:  CPU (NumPy/SciPy — no GPU needed)
+  Time:    ~4 minutes (3.8 min encoding generated + <1s FAD calc)
+
+  How it works:
+  1. Loads 50 cached real embeddings from .npy files
+     - Each shape (1, N, 1280) → squeeze → mean-pool → (1280,)
+  2. Encodes 20 generated WAV files through VampNetWrapper
+     - Same process as STEP A but for generated audio
+     - Caches result to gen_embeddings.npz
+  3. Computes FAD (Fréchet Audio Distance):
+     - mu_real = mean of real embeddings (1280-dim)
+     - mu_gen = mean of generated embeddings
+     - sigma_real = covariance matrix of real embeddings
+     - sigma_gen = covariance matrix of generated embeddings
+     - FAD = ||mu_r - mu_g||² + Tr(sig_r + sig_g - 2*sqrt(sig_r @ sig_g))
+
+  Note: fadtk CLI was BROKEN on this platform due to:
+  - torchcodec native .dylib incompatible with macOS ARM64
+  - clap-laion-audio model fails with SSL certificate error
+  - All fadtk models require torchcodec which doesn't work
+
+  Solution: Computed FAD manually using our own VampNet embeddings
+  with scipy.linalg.sqrtm for the Frechet distance formula.
+
+================================================================
+6. OUTPUTS
+================================================================
+
+6a. Embeddings (243 files)
+    Location: ~/wham_project/wham/embeddings/*.npy
+    Shape:    (1, seq_len, 1280) float32 per file
+    seq_len:  Varies by audio length (~77-126 frames)
+    Stats:    Mean ≈ -0.139, Std ≈ 3.897
+    None are NaN — all valid
+
+6b. Generated Pseudocodas (20 files)
+    Location: ~/wham_project/wham/generated_audio/pseudocoda_*.wav
+    Names:    pseudocoda_1.wav, pseudocoda_10.wav, pseudocoda_100.wav,
+              pseudocoda_1000.wav through pseudocoda_1015.wav
+    Format:   WAV, mono, 24kHz (VampNet native sample rate)
+    Duration: ~1-3 seconds each (depends on conditioning)
+
+6c. FAD Score
+    Value:    1206.63
+    Files:    50 real vs 20 generated
+    Embedding model: VampNetWrapper (1280-dim, mean-pooled)
+    Note:     High score expected — coarse-only generation (no C2F
+              refinement), small sample size (20 files)
+
+6d. Zip Archive
+    Location: ~/wham_project_outputs.zip (105 MB)
+    Contents:
+      - embeddings/          (243 .npy files)
+      - generated_audio/     (20 .wav files)
+      - gen_embeddings.npz   (cached generated embeddings)
+      - compute_fad.py       (FAD computation script)
+      - extract_dswp_embeddings.py (embedding extraction script)
+      - vampnet/batch_generate.py  (batch generation script)
+      - wham/embedding/models.py   (patched VampNetWrapper)
+      - wham/embedding/__init__.py (patched imports)
+      - vampnet/vampnet/beats.py   (patched torch.load)
+
+6e. Final Report
+    Location: ~/wham_project/FINAL_REPORT.md
+
+================================================================
+7. TIMING BREAKDOWN
+================================================================
+
+  Model loading:           4.4s
+  Embedding 243 files:     ~17 min (4.2s/file avg)
+  Generating 20 pseudos:   ~14 min (42s/file avg)
+  Encoding 20 for FAD:     ~3.8 min (11.4s/file avg)
+  FAD calculation:         <1s
+  --------------------------------
+  TOTAL:                   ~36 minutes
+
+================================================================
+8. ISSUES ENCOUNTERED & RESOLUTIONS
+================================================================
+
+Issue 1: "from wam import" fails
+  Cause:   Directory is "wham" not "wam"
+  Fix:     Changed import to "from wham import"
+
+Issue 2: "collections.MutableSequence" deprecation error
+  Cause:   Python 3.10 removed direct access on collections
+  Fix:     Changed to collections.abc.MutableSequence
+
+Issue 3: torch.load() weights_only error
+  Cause:   PyTorch 2.x defaults to weights_only=True
+  Fix:     Added weights_only=False explicitly
+
+Issue 4: huggingface-hub API breakage
+  Cause:   Newer versions changed API
+  Fix:     Pinned to huggingface-hub<1.0
+
+Issue 5: wrapper.encode() does not exist
+  Cause:   Notebook assumed wrong API
+  Fix:     Used wrapper.forward() directly (wrapper(audio_tensor))
+
+Issue 6: Audio must be 16kHz
+  Cause:   VampNetWrapper expects 16kHz input
+  Fix:     Added librosa.resample() to 16kHz
+
+Issue 7: fadtk CLI completely broken
+  Cause:   torchcodec .dylib incompatible with macOS ARM64
+  Fix:     Computed FAD manually using scipy.linalg.sqrtm
+
+Issue 8: SSL certificate error (clap-laion-audio)
+  Cause:   Certificate expired on Zenodo download server
+  Fix:     Skipped — used manual FAD computation instead
+
+================================================================
+9. FILE LOCATIONS QUICK REFERENCE
+================================================================
+
+  ~/wham_project/
+  ├── wham_env/                    (Python 3.10 venv)
+  ├── wham/                        (cloned WHAM repo)
+  │   ├── embeddings/              (243 .npy embedding files)
+  │   ├── generated_audio/         (20 pseudocoda .wav files)
+  │   ├── gen_embeddings.npz       (cached generated embeddings)
+  │   ├── compute_fad.py           (FAD computation script)
+  │   ├── extract_dswp_embeddings.py
+  │   ├── FINAL_REPORT.md
+  │   ├── wham/embedding/
+  │   │   ├── __init__.py          (patched)
+  │   │   └── models.py            (patched, VampNetWrapper)
+  │   └── vampnet/
+  │       ├── models/              (4 pretrained weight files)
+  │       │   ├── coarse.pth
+  │       │   ├── c2f.pth
+  │       │   ├── codec.pth
+  │       │   └── wavebeat.pth
+  │       ├── batch_generate.py    (rewritten for app.py pattern)
+  │       ├── vampnet/beats.py     (patched)
+  │       └── data/testing_data/dswp_subset/  (243 WAV files)
+  └── FINAL_REPORT.md
+
+  ~/wham_project_outputs.zip       (105 MB archive)
+
+================================================================
+10. ENVIRONMENT VARIABLES
+================================================================
+
+  PYTORCH_ENABLE_MPS_FALLBACK=1
+    Required for all VampNet inference steps.
+    Allows PyTorch to fall back to CPU for ops not supported on MPS
+    (e.g., argmax, multinomial sampling).
+
+================================================================
+11. KEY COMMANDS USED
+================================================================
+
+  # Activate venv
+  source ~/wham_project/wham_env/bin/activate
+
+  # Extract embeddings
+  PYTORCH_ENABLE_MPS_FALLBACK=1 python extract_dswp_embeddings.py
+
+  # Generate pseudocodas
+  PYTORCH_ENABLE_MPS_FALLBACK=1 python vampnet/batch_generate.py
+
+  # Compute FAD
+  PYTORCH_ENABLE_MPS_FALLBACK=1 python compute_fad.py
+
+  # Zip outputs
+  zip -r ~/wham_project_outputs.zip ~/wham_project/wham/embeddings/ \
+    ~/wham_project/wham/generated_audio/ ...
+
+================================================================
+END OF DOCUMENT
+================================================================

@@ -1,0 +1,16 @@
+descript-audiotools @ git+https://github.com/hugofloresgarcia/audiotools.git
+argbind
+pandas
+pathlib
+pydub
+ffmpeg-python
+tqdm
+scikit-learn
+wandb
+gdown
+soundfile
+transformers
+torch
+Cython
+fadtk
+urllib3==2.0

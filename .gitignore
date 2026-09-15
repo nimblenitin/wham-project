@@ -1,0 +1,22 @@
+# Virtual environment
+wham_env/
+
+# Pretrained weights (large, download from Zenodo)
+wham/vampnet/models/*.pth
+
+# Raw audio data (download from DSWP)
+wham/vampnet/data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+
+# Generated output zip
+../wham_project_outputs.zip
+
+# Torch/hub cache
+.cache/
